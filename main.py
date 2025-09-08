@@ -1,10 +1,8 @@
 # main.py
 # Boletim diário: 1 ÁUDIO POR FONTE em PT-BR (~6 min), por temas.
-# Ajustes:
-# - Voz masculina (Neural2/Wavenet) com fallback
-# - Roteiro sempre em PT-BR + nomes em inglês com pronúncia americana (SSML <lang>)
-# - Chunking por bytes (5000) + JOIN de MP3 -> 1 único áudio por fonte
-# - Prosódia mais "podcast": pausas naturais, ritmo levemente vivo
+# TTS: Azure Speech REST (voz masculina, estilo "podcast").
+# CNN/NYTimes (EN) -> roteiro final SEMPRE traduzido para PT-BR.
+# Nomes em inglês com pronúncia americana via <lang xml:lang="en-US">.
 
 import os, io, time, json, re, hashlib, requests, feedparser, yaml
 from datetime import datetime
@@ -12,15 +10,11 @@ from lxml import html
 from readability import Document
 from telegram import Bot
 
-# Resumo extrativo
+# Sumário extrativo
 from sumy.parsers.plaintext import PlaintextParser
 from sumy.nlp.tokenizers import Tokenizer
 from sumy.summarizers.text_rank import TextRankSummarizer
 
-# Google TTS
-from google.cloud import texttospeech as tts
-
-# Tradução
 from deep_translator import GoogleTranslator
 
 # =========================
@@ -29,8 +23,11 @@ from deep_translator import GoogleTranslator
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 
+AZ_REGION = os.getenv("AZURE_SPEECH_REGION")
+AZ_KEY    = os.getenv("AZURE_SPEECH_KEY")
+
 # =========================
-# Configurações gerais
+# Configurações
 # =========================
 CFG_PATH = "sources.yaml"
 with open(CFG_PATH, "r", encoding="utf-8") as f:
@@ -43,52 +40,40 @@ if os.path.exists(STATE_FILE):
 else:
     SEEN = set()
 
-# =========================
-# Alvo de duração e detalhes
-# =========================
+# Alvo de duração e detalhamento
 TARGET_MINUTES = 6.0
-WPM_ESTIMATE   = 160              # ritmo conversacional (com rate ~1.02)
+WPM_ESTIMATE   = 160                    # ritmo conversacional
 MAX_WORDS      = int(TARGET_MINUTES * WPM_ESTIMATE)  # ~960 palavras
 
 SENTENCES_PER_ITEM   = 4
 MAX_ITEMS_PER_TOPIC  = 4
 LIMIT_PER_SOURCE_DEF = 8
 
-# Voz/prosódia (masculina + natural)
-VOICE_PREFERENCE = ["pt-BR-Neural2-B", "pt-BR-Wavenet-B", "pt-BR-Wavenet-D"]
-VOICE_RATE  = 1.02
-VOICE_PITCH = +0.1
+# Voz/estilo Azure (podcast masculino)
+VOICE_PRIMARY   = "pt-BR-AntonioNeural"
+VOICE_FALLBACKS = ["pt-BR-AndreNeural", "pt-BR-FranciscaNeural", "pt-BR-ThalitaNeural"]  # se precisar
+AZURE_STYLE     = "narration-relaxed"   # ou "newscast-casual", "chat"
+AZURE_RATE      = 1.04                  # levemente mais vivo
+AZURE_PITCH_ST  = +0.2                  # presença
 
-# Limites de segurança
-MAX_SSML_BYTES = 4800   # margem segura < 5000
-MAX_TEXT_BYTES = 4300   # alvo por chunk antes de gerar SSML
+# Limites
+MAX_TEXT_BYTES = 4300   # por chunk antes de virar SSML (margem segura)
+MAX_SSML_BYTES = 9500   # Azure aceita mais que 5k; ainda assim, deixamos margem
 
 # =========================
-# Utilidades
+# Utilitários
 # =========================
-def init_google_credentials():
-    cred_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
-    if cred_json and not os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
-        path = "/tmp/gcred.json"
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(cred_json)
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = path
-
 def clean(s):
     return " ".join((s or "").split())
 
 def strip_urls(text: str) -> str:
     return re.sub(r'https?://\S+|www\.\S+', ' (link na descrição) ', text or "", flags=re.IGNORECASE)
 
-def strip_unsupported(text: str) -> str:
-    text = re.sub(r'[\x00-\x08\x0B-\x0C\x0E-\x1F]', ' ', text)  # controles
-    text = re.sub(r'(?<!\w)&(?!\w)', ' e ', text)               # & isolado
-    return text
+def strip_ctrl(text: str) -> str:
+    return re.sub(r'[\x00-\x08\x0B-\x0C\x0E-\x1F]', ' ', text or "")
 
-def html_escape_basic(text: str) -> str:
-    return (text.replace("&", "&amp;")
-                .replace("<", "&lt;")
-                .replace(">", "&gt;"))
+def html_esc(text: str) -> str:
+    return text.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
 def fetch_fulltext(url, timeout=12):
     try:
@@ -123,7 +108,6 @@ def summarize_text(text, lang="en", max_sentences=None, min_chars=None):
 
     lang_map = {"pt": "portuguese", "en": "english"}
     sumy_lang = lang_map.get(lang, "english")
-
     try:
         parser = PlaintextParser.from_string(text, Tokenizer(sumy_lang))
         summarizer = TextRankSummarizer()
@@ -158,7 +142,7 @@ def item_id(entry):
     return hashlib.sha1(base.encode("utf-8")).hexdigest()
 
 # =========================
-# Nomes em inglês (pronúncia americana)
+# Nomes em inglês (pronúncia en-US)
 # =========================
 ENG_STOP = set(x.lower() for x in [
     "The","A","An","And","Of","On","At","In","To","For","With","By","From",
@@ -167,18 +151,12 @@ ENG_STOP = set(x.lower() for x in [
 ])
 
 def extract_english_names(items, source_lang: str):
-    """
-    Extrai nomes próprios dos títulos originais de fontes em inglês (heurística leve).
-    Retorna set de strings (ex.: 'United States', 'Joe Biden', 'Apple').
-    """
     names = set()
-    if not source_lang.lower().startswith("en"):
+    if not str(source_lang).lower().startswith("en"):
         return names
     for it in items:
         title = it.get("title", "") or ""
-        # junta sequências de palavras Title Case ASCII como nomes compostos
         tokens = re.findall(r"\b[A-Z][a-zA-Z\-]+\b", title)
-        # monta grupos contíguos Title Case
         group = []
         for t in tokens:
             if t.lower() in ENG_STOP:
@@ -189,7 +167,6 @@ def extract_english_names(items, source_lang: str):
             group.append(t)
         if group:
             names.add(" ".join(group))
-    # filtra nomes muito curtos
     names = {n for n in names if len(n) >= 3}
     return names
 
@@ -225,14 +202,14 @@ def group_by_topic_pt(items_pt):
     return {t: grouped[t] for t in order if t in grouped and grouped[t]}
 
 # =========================
-# Roteiro
+# Roteiro final em PT-BR
 # =========================
 def build_audio_script_pt(source_name, grouped_topics):
     partes = []
     hoje = datetime.now().strftime("%d/%m/%Y")
     partes.append(f"Boletim de notícias do {source_name}, {hoje}.")
     partes.append("Vamos aos destaques organizados por assunto.")
-    partes.append("¦")  # pausa longa inicial
+    partes.append("¦")
 
     for topic, items in grouped_topics.items():
         partes.append(f"Seção: {topic}.")
@@ -243,65 +220,39 @@ def build_audio_script_pt(source_name, grouped_topics):
             partes.append(f"Notícia {i}: {titulo}.")
             partes.append(f"Resumo: {resumo}")
         partes.append("Fechamos esta seção.")
-        partes.append("¦")  # pausa longa entre seções
+        partes.append("¦")
 
     partes.append("Esses foram os assuntos mais relevantes de hoje.")
     partes.append("Até a próxima edição.")
     script = " ".join(partes)
 
-    # PT-BR garantido no roteiro final
+    # Força PT-BR no roteiro final (CNN/NYT inclusive)
     script_pt = translate_to_pt(script)
 
-    # Controle de duração (~6min)
     if word_count(script_pt) > MAX_WORDS:
         script_pt = limit_words(script_pt, MAX_WORDS)
-
     return script_pt
 
 # =========================
-# SSML seguro + pronúncia EN-US para nomes
+# SSML Azure "podcast" + pronúncia EN-US
 # =========================
-def apply_english_pronunciation(raw_text: str, names_en: set) -> str:
-    """
-    Marca no texto nomes (exatos) com <lang xml:lang="en-US">...</lang>.
-    Aplica antes de escapar, mas faremos a substituição após escapar também.
-    Estratégia: substituir ocorrências EXATAS sensíveis a maiúsculas.
-    """
-    if not names_en:
-        return raw_text
-    # usamos delimitadores de palavra para evitar pegar substrings
-    for name in sorted(names_en, key=len, reverse=True):
-        pattern = r'\b' + re.escape(name) + r'\b'
-        raw_text = re.sub(pattern, f"<ENNAME>{name}</ENNAME>", raw_text)
-    return raw_text
+def build_ssml_podcast_pt(text_pt: str,
+                          voice="pt-BR-AntonioNeural",
+                          style="narration-relaxed",
+                          rate=AZURE_RATE,
+                          pitch_st=AZURE_PITCH_ST,
+                          names_en: set = None) -> str:
+    t = text_pt.replace("¦", " <LONG_BREAK> ")
+    t = clean(strip_ctrl(strip_urls(t)))
 
-def finalize_english_pronunciation(escaped_text: str) -> str:
-    """
-    Converte marcadores <ENNAME>…</ENNAME> (já com conteúdo escapado) em <lang en-US>…</lang>.
-    """
-    def _repl(m):
-        inner = m.group(1)  # já escapado
-        return f"<lang xml:lang=\"en-US\">{inner}</lang>"
-    return re.sub(r"&lt;ENNAME&gt;(.+?)&lt;/ENNAME&gt;", _repl, escaped_text)
+    # marca nomes para pronúncia americana
+    if names_en:
+        for name in sorted(names_en, key=len, reverse=True):
+            t = re.sub(r'\b' + re.escape(name) + r'\b',
+                       f"<ENNAME>{name}</ENNAME>", t)
 
-def text_to_valid_ssml(text: str, rate: float, pitch_st: float, names_en: set = None) -> str:
-    """
-    Constrói SSML válido para Neural2:
-    - remove URLs e caracteres de controle
-    - adiciona marcador de pausa longa '¦' -> <break 700ms>
-    - divide por sentenças; insere <s>…</s> + <break> com pausas naturais
-    - nomes ingleses marcados com <lang xml:lang="en-US">…</lang>
-    """
-    text = strip_urls(text)
-    text = strip_unsupported(text)
-    text = text.replace("¦", " <LONG_BREAK> ")
-    text = clean(text)
-
-    # aplica marcação de nomes EN antes do escape
-    text = apply_english_pronunciation(text, names_en or set())
-
-    sentences = re.split(r'(?<=[\.\!\?])\s+', text)
-    ssml_parts = []
+    sentences = re.split(r'(?<=[\.\!\?])\s+', t)
+    parts = []
     for s in sentences:
         s = s.strip()
         if not s:
@@ -311,42 +262,38 @@ def text_to_valid_ssml(text: str, rate: float, pitch_st: float, names_en: set = 
             s = s.replace("<LONG_BREAK>", "").strip()
             long_break = True
 
-        # escapa conteúdo
-        s_esc = html_escape_basic(s)
-        # reativa <lang en-US> substituindo marcadores
-        s_esc = finalize_english_pronunciation(s_esc)
+        s = html_esc(s)
+        s = re.sub(r"&lt;ENNAME&gt;(.*?)&lt;/ENNAME&gt;",
+                   r'<lang xml:lang="en-US">\1</lang>', s)
 
-        if s_esc:
-            br = "220ms" if len(s_esc) < 140 else "320ms"
-            if long_break:
-                ssml_parts.append(f"<s>{s_esc}</s><break time='700ms'/>")
-            else:
-                ssml_parts.append(f"<s>{s_esc}</s><break time='{br}'/>")
-        elif long_break:
-            ssml_parts.append("<break time='700ms'/>")
+        br = "260ms" if len(s) < 140 else "380ms"
+        parts.append(f"<s>{s}</s><break time='700ms'/>" if long_break else f"<s>{s}</s><break time='{br}'/>")
 
-    ssml_body = " ".join(ssml_parts)
     ssml = f"""
-<speak>
-  <prosody rate="{rate}" pitch="{pitch_st:+.1f}st">
-    <p>{ssml_body}</p>
-  </prosody>
-</speak>
-    """.strip()
+<speak version="1.0" xml:lang="pt-BR"
+       xmlns:mstts="https://www.w3.org/2001/mstts"
+       xmlns="http://www.w3.org/2001/10/synthesis">
+  <voice name="{voice}">
+    <mstts:express-as style="{style}" styledegree="1.5">
+      <prosody rate="{rate}" pitch="{pitch_st:+.1f}st">
+        {' '.join(parts)}
+      </prosody>
+    </mstts:express-as>
+  </voice>
+</speak>""".strip()
     return ssml
 
+# =========================
+# Chunking e join de MP3
+# =========================
 def chunk_script_by_bytes(text: str, max_text_bytes: int = MAX_TEXT_BYTES):
-    """
-    Divide o texto bruto em partes por bytes (UTF-8),
-    priorizando seções '¦' e, depois, sentenças.
-    """
     parts = []
     sections = [s.strip() for s in text.split("¦") if s.strip()]
     current = ""
     for sec in sections:
-        candidate = (current + " " + sec).strip() if current else sec
-        if len(candidate.encode("utf-8")) <= max_text_bytes:
-            current = candidate
+        cand = (current + " " + sec).strip() if current else sec
+        if len(cand.encode("utf-8")) <= max_text_bytes:
+            current = cand
         else:
             if current:
                 parts.append(current)
@@ -368,41 +315,46 @@ def chunk_script_by_bytes(text: str, max_text_bytes: int = MAX_TEXT_BYTES):
         parts.append(current)
     return parts if parts else [text]
 
-def synthesize_with_fallback(ssml: str):
-    """
-    Tenta sintetizar com as vozes de VOICE_PREFERENCE.
-    Retorna (BytesIO, voice_name) ou levanta a última exceção.
-    """
-    init_google_credentials()
-    client = tts.TextToSpeechClient()
-    last_error = None
-    for voice_name in VOICE_PREFERENCE:
-        try:
-            synthesis_input = tts.SynthesisInput(ssml=ssml)
-            voice = tts.VoiceSelectionParams(language_code="pt-BR", name=voice_name)
-            audio_config = tts.AudioConfig(audio_encoding=tts.AudioEncoding.MP3)
-            response = client.synthesize_speech(
-                input=synthesis_input, voice=voice, audio_config=audio_config
-            )
-            buf = io.BytesIO(response.audio_content)
-            buf.seek(0)
-            return buf, voice_name
-        except Exception as e:
-            last_error = e
-            continue
-    raise last_error
-
 def join_mp3(buffers):
-    """
-    Junta múltiplos MP3 em um único MP3 por concatenação de frames.
-    (Na prática funciona bem em players/Telegram.)
-    """
     out = io.BytesIO()
     for b in buffers:
         b.seek(0)
         out.write(b.read())
     out.seek(0)
     return out
+
+# =========================
+# Azure Speech REST (MP3)
+# =========================
+def azure_speech_tts_mp3(ssml: str,
+                         voices=None,
+                         audio_format="audio-24khz-48kbitrate-mono-mp3") -> io.BytesIO:
+    if not AZ_REGION or not AZ_KEY:
+        raise RuntimeError("Defina AZURE_SPEECH_REGION e AZURE_SPEECH_KEY nos Secrets.")
+    if voices is None:
+        voices = [VOICE_PRIMARY] + VOICE_FALLBACKS
+
+    url = f"https://{AZ_REGION}.tts.speech.microsoft.com/cognitiveservices/v1"
+    last_err = None
+    for v in voices:
+        ssml_v = re.sub(r'name="pt-BR-[A-Za-z]+Neural"', f'name="{v}"', ssml)
+        headers = {
+            "Ocp-Apim-Subscription-Key": AZ_KEY,
+            "Content-Type": "application/ssml+xml",
+            "X-Microsoft-OutputFormat": audio_format,
+            "User-Agent": "news-telegram-bot"
+        }
+        try:
+            r = requests.post(url, headers=headers, data=ssml_v.encode("utf-8"), timeout=45)
+            if r.status_code == 200 and r.content:
+                buf = io.BytesIO(r.content)
+                buf.seek(0)
+                return buf
+            last_err = f"{r.status_code} {r.text[:200]}"
+        except Exception as e:
+            last_err = str(e)
+            continue
+    raise RuntimeError(f"Azure TTS falhou: {last_err}")
 
 # =========================
 # Telegram
@@ -418,13 +370,16 @@ def send_audio(chat_id, audio_buf, title="Boletim", performer="Bot", filename="b
 # =========================
 def run():
     if not BOT_TOKEN or not CHAT_ID:
-        raise SystemExit("Defina TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID como variáveis de ambiente.")
+        raise SystemExit("Defina TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID.")
+    if not AZ_REGION or not AZ_KEY:
+        raise SystemExit("Defina AZURE_SPEECH_REGION e AZURE_SPEECH_KEY.")
 
-    send_text(CHAT_ID, "🎙️ Iniciando: vou coletar, resumir por temas e enviar 1 áudio por fonte (voz masculina, PT-BR)…")
+    send_text(CHAT_ID, "🎙️ Iniciando: vou coletar, resumir por temas e enviar 1 áudio por fonte (voz masculina, estilo podcast)…")
 
     per_source_items = {}
     limit = CFG.get("limit_per_source", LIMIT_PER_SOURCE_DEF)
 
+    # Coleta por feed
     for feed in CFG["feeds"]:
         source = feed["name"]
         lang   = feed.get("lang", "pt")
@@ -456,7 +411,7 @@ def run():
                 sum_lang = "pt" if str(lang).startswith("pt") else "en"
                 summary  = summarize_text(base_text, lang=sum_lang, max_sentences=None)
 
-                # traduz SEMPRE para PT-BR (garante áudio 100% PT)
+                # traduz SEMPRE para PT-BR (garante áudio 100% PT, CNN incluída)
                 title_pt   = translate_to_pt(title)
                 summary_pt = translate_to_pt(summary)
 
@@ -465,7 +420,8 @@ def run():
                     "link": link,
                     "summary": summary,
                     "title_pt": title_pt,
-                    "summary_pt": summary_pt
+                    "summary_pt": summary_pt,
+                    "lang": lang
                 })
 
                 SEEN.add(iid)
@@ -479,13 +435,11 @@ def run():
         if not items:
             continue
 
-        # nomes ingleses (para pronúncia en-US) — só para fontes em inglês
-        names_en = extract_english_names(items, lang)
+        names_en   = extract_english_names(items, lang)
+        grouped    = group_by_topic_pt(items)
+        script_pt  = build_audio_script_pt(source_name, grouped)
 
-        grouped   = group_by_topic_pt(items)
-        script_pt = build_audio_script_pt(source_name, grouped)
-
-        # texto com links por tema
+        # Texto com links por tema (útil para acompanhar)
         try:
             blocks = []
             for topic, itlist in grouped.items():
@@ -498,50 +452,52 @@ def run():
         except Exception:
             pass
 
-        # --- Chunking por bytes (antes de virar SSML) ---
+        # Chunk por bytes (segurança) -> sintetiza cada chunk -> junta em 1 MP3
         text_chunks = chunk_script_by_bytes(script_pt, max_text_bytes=MAX_TEXT_BYTES)
-
-        # Síntese de todas as partes e JUNÇÃO em um único MP3
         part_buffers = []
-        used_voice_name = None
-        for idx, chunk_text in enumerate(text_chunks, start=1):
-            try:
-                ssml = text_to_valid_ssml(chunk_text, VOICE_RATE, VOICE_PITCH, names_en=names_en)
+        for chunk_text in text_chunks:
+            ssml = build_ssml_podcast_pt(
+                chunk_text,
+                voice=VOICE_PRIMARY,
+                style=AZURE_STYLE,
+                rate=AZURE_RATE,
+                pitch_st=AZURE_PITCH_ST,
+                names_en=names_en
+            )
+            # se ainda exceder, quebra por sentenças e sintetiza
+            if len(ssml.encode("utf-8")) > MAX_SSML_BYTES:
+                sentences = re.split(r'(?<=[\.\!\?])\s+', chunk_text)
+                sub = []
+                cur = ""
+                subparts = []
+                for s in sentences:
+                    cand = (cur + " " + s).strip() if cur else s
+                    tmp_ssml = build_ssml_podcast_pt(cand, voice=VOICE_PRIMARY, style=AZURE_STYLE,
+                                                     rate=AZURE_RATE, pitch_st=AZURE_PITCH_ST, names_en=names_en)
+                    if len(tmp_ssml.encode("utf-8")) <= MAX_SSML_BYTES:
+                        cur = cand
+                    else:
+                        if cur:
+                            subparts.append(cur)
+                        cur = s
+                if cur:
+                    subparts.append(cur)
 
-                # Garantia final de bytes do SSML
-                if len(ssml.encode("utf-8")) > MAX_SSML_BYTES:
-                    # Divide novamente por sentenças se necessário
-                    sentences = re.split(r'(?<=[\.\!\?])\s+', chunk_text)
-                    subparts = []
-                    current = ""
-                    for s in sentences:
-                        cand = (current + " " + s).strip() if current else s
-                        tmp_ssml = text_to_valid_ssml(cand, VOICE_RATE, VOICE_PITCH, names_en=names_en)
-                        if len(tmp_ssml.encode("utf-8")) <= MAX_SSML_BYTES:
-                            current = cand
-                        else:
-                            if current:
-                                subparts.append(current)
-                            current = s
-                    if current:
-                        subparts.append(current)
-
-                    for sp in subparts:
-                        ssml_sub = text_to_valid_ssml(sp, VOICE_RATE, VOICE_PITCH, names_en=names_en)
-                        audio_buf, used_voice_name = synthesize_with_fallback(ssml_sub)
-                        part_buffers.append(audio_buf)
-                else:
-                    audio_buf, used_voice_name = synthesize_with_fallback(ssml)
+                for sp in subparts:
+                    ssml_sub = build_ssml_podcast_pt(sp, voice=VOICE_PRIMARY, style=AZURE_STYLE,
+                                                     rate=AZURE_RATE, pitch_st=AZURE_PITCH_ST, names_en=names_en)
+                    audio_buf = azure_speech_tts_mp3(ssml_sub)
                     part_buffers.append(audio_buf)
-
-            except Exception as e:
-                send_text(CHAT_ID, f"❌ Falha ao sintetizar parte do {source_name}: {e}")
+            else:
+                audio_buf = azure_speech_tts_mp3(ssml)
+                part_buffers.append(audio_buf)
 
         if part_buffers:
             full_mp3 = join_mp3(part_buffers)
-            title_audio = f"{source_name} — Boletim (voz: {used_voice_name})"
-            filename    = f"{source_name}_boletim.mp3"
-            send_audio(CHAT_ID, full_mp3, title=title_audio, performer=source_name, filename=filename)
+            send_audio(CHAT_ID, full_mp3,
+                       title=f"{source_name} — Boletim",
+                       performer=source_name,
+                       filename=f"{source_name}_boletim.mp3")
 
         total_boletins += 1
         time.sleep(1)
