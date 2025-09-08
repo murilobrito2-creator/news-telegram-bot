@@ -1,10 +1,10 @@
 # main.py
-# Boletim diário: 1 ÁUDIO POR FONTE em PT-BR, detalhado por temas (~6 min).
-# Correções:
-# - Chunking por bytes p/ respeitar 5000 bytes de SSML
-# - Fallback de voz (Neural2-C -> Neural2-A -> Wavenet-B)
-# - SSML seguro p/ Neural2
-# - Tradução forçada do roteiro final p/ PT-BR
+# Boletim diário: 1 ÁUDIO POR FONTE em PT-BR (~6 min), por temas.
+# Ajustes:
+# - Voz masculina (Neural2/Wavenet) com fallback
+# - Roteiro sempre em PT-BR + nomes em inglês com pronúncia americana (SSML <lang>)
+# - Chunking por bytes (5000) + JOIN de MP3 -> 1 único áudio por fonte
+# - Prosódia mais "podcast": pausas naturais, ritmo levemente vivo
 
 import os, io, time, json, re, hashlib, requests, feedparser, yaml
 from datetime import datetime
@@ -47,21 +47,21 @@ else:
 # Alvo de duração e detalhes
 # =========================
 TARGET_MINUTES = 6.0
-WPM_ESTIMATE   = 160              # palavras/minuto (rate ~1.02)
+WPM_ESTIMATE   = 160              # ritmo conversacional (com rate ~1.02)
 MAX_WORDS      = int(TARGET_MINUTES * WPM_ESTIMATE)  # ~960 palavras
 
 SENTENCES_PER_ITEM   = 4
 MAX_ITEMS_PER_TOPIC  = 4
 LIMIT_PER_SOURCE_DEF = 8
 
-# Voz/prosódia
-VOICE_PREFERENCE = ["pt-BR-Neural2-C", "pt-BR-Neural2-A", "pt-BR-Wavenet-B"]
+# Voz/prosódia (masculina + natural)
+VOICE_PREFERENCE = ["pt-BR-Neural2-B", "pt-BR-Wavenet-B", "pt-BR-Wavenet-D"]
 VOICE_RATE  = 1.02
-VOICE_PITCH = +0.2
+VOICE_PITCH = +0.1
 
 # Limites de segurança
 MAX_SSML_BYTES = 4800   # margem segura < 5000
-MAX_TEXT_BYTES = 4300   # alvo de bytes de texto bruto por chunk antes de virar SSML
+MAX_TEXT_BYTES = 4300   # alvo por chunk antes de gerar SSML
 
 # =========================
 # Utilidades
@@ -158,6 +158,42 @@ def item_id(entry):
     return hashlib.sha1(base.encode("utf-8")).hexdigest()
 
 # =========================
+# Nomes em inglês (pronúncia americana)
+# =========================
+ENG_STOP = set(x.lower() for x in [
+    "The","A","An","And","Of","On","At","In","To","For","With","By","From",
+    "Is","Are","Be","Was","Were","As","Not","But","Or",
+    "New","Old","Over","After","Before","More","Less",
+])
+
+def extract_english_names(items, source_lang: str):
+    """
+    Extrai nomes próprios dos títulos originais de fontes em inglês (heurística leve).
+    Retorna set de strings (ex.: 'United States', 'Joe Biden', 'Apple').
+    """
+    names = set()
+    if not source_lang.lower().startswith("en"):
+        return names
+    for it in items:
+        title = it.get("title", "") or ""
+        # junta sequências de palavras Title Case ASCII como nomes compostos
+        tokens = re.findall(r"\b[A-Z][a-zA-Z\-]+\b", title)
+        # monta grupos contíguos Title Case
+        group = []
+        for t in tokens:
+            if t.lower() in ENG_STOP:
+                if group:
+                    names.add(" ".join(group))
+                    group = []
+                continue
+            group.append(t)
+        if group:
+            names.add(" ".join(group))
+    # filtra nomes muito curtos
+    names = {n for n in names if len(n) >= 3}
+    return names
+
+# =========================
 # Agrupamento por assuntos (PT)
 # =========================
 def detect_topic_pt(title_pt, summary_pt):
@@ -189,14 +225,14 @@ def group_by_topic_pt(items_pt):
     return {t: grouped[t] for t in order if t in grouped and grouped[t]}
 
 # =========================
-# Roteiro e SSML
+# Roteiro
 # =========================
 def build_audio_script_pt(source_name, grouped_topics):
     partes = []
     hoje = datetime.now().strftime("%d/%m/%Y")
     partes.append(f"Boletim de notícias do {source_name}, {hoje}.")
     partes.append("Vamos aos destaques organizados por assunto.")
-    partes.append("¦")
+    partes.append("¦")  # pausa longa inicial
 
     for topic, items in grouped_topics.items():
         partes.append(f"Seção: {topic}.")
@@ -207,7 +243,7 @@ def build_audio_script_pt(source_name, grouped_topics):
             partes.append(f"Notícia {i}: {titulo}.")
             partes.append(f"Resumo: {resumo}")
         partes.append("Fechamos esta seção.")
-        partes.append("¦")
+        partes.append("¦")  # pausa longa entre seções
 
     partes.append("Esses foram os assuntos mais relevantes de hoje.")
     partes.append("Até a próxima edição.")
@@ -222,17 +258,47 @@ def build_audio_script_pt(source_name, grouped_topics):
 
     return script_pt
 
-def text_to_valid_ssml(text: str, rate: float, pitch_st: float) -> str:
+# =========================
+# SSML seguro + pronúncia EN-US para nomes
+# =========================
+def apply_english_pronunciation(raw_text: str, names_en: set) -> str:
+    """
+    Marca no texto nomes (exatos) com <lang xml:lang="en-US">...</lang>.
+    Aplica antes de escapar, mas faremos a substituição após escapar também.
+    Estratégia: substituir ocorrências EXATAS sensíveis a maiúsculas.
+    """
+    if not names_en:
+        return raw_text
+    # usamos delimitadores de palavra para evitar pegar substrings
+    for name in sorted(names_en, key=len, reverse=True):
+        pattern = r'\b' + re.escape(name) + r'\b'
+        raw_text = re.sub(pattern, f"<ENNAME>{name}</ENNAME>", raw_text)
+    return raw_text
+
+def finalize_english_pronunciation(escaped_text: str) -> str:
+    """
+    Converte marcadores <ENNAME>…</ENNAME> (já com conteúdo escapado) em <lang en-US>…</lang>.
+    """
+    def _repl(m):
+        inner = m.group(1)  # já escapado
+        return f"<lang xml:lang=\"en-US\">{inner}</lang>"
+    return re.sub(r"&lt;ENNAME&gt;(.+?)&lt;/ENNAME&gt;", _repl, escaped_text)
+
+def text_to_valid_ssml(text: str, rate: float, pitch_st: float, names_en: set = None) -> str:
     """
     Constrói SSML válido para Neural2:
-    - remove URLs, caracteres de controle; escapa &, <, >
-    - divide por sentenças; insere <s>…</s> + <break>
-    - converte '¦' em pausa longa (~700ms)
+    - remove URLs e caracteres de controle
+    - adiciona marcador de pausa longa '¦' -> <break 700ms>
+    - divide por sentenças; insere <s>…</s> + <break> com pausas naturais
+    - nomes ingleses marcados com <lang xml:lang="en-US">…</lang>
     """
     text = strip_urls(text)
     text = strip_unsupported(text)
     text = text.replace("¦", " <LONG_BREAK> ")
     text = clean(text)
+
+    # aplica marcação de nomes EN antes do escape
+    text = apply_english_pronunciation(text, names_en or set())
 
     sentences = re.split(r'(?<=[\.\!\?])\s+', text)
     ssml_parts = []
@@ -240,17 +306,24 @@ def text_to_valid_ssml(text: str, rate: float, pitch_st: float) -> str:
         s = s.strip()
         if not s:
             continue
+        long_break = False
         if "<LONG_BREAK>" in s:
             s = s.replace("<LONG_BREAK>", "").strip()
-            if s:
-                s = html_escape_basic(s)
-                ssml_parts.append(f"<s>{s}</s><break time='700ms'/>")
+            long_break = True
+
+        # escapa conteúdo
+        s_esc = html_escape_basic(s)
+        # reativa <lang en-US> substituindo marcadores
+        s_esc = finalize_english_pronunciation(s_esc)
+
+        if s_esc:
+            br = "220ms" if len(s_esc) < 140 else "320ms"
+            if long_break:
+                ssml_parts.append(f"<s>{s_esc}</s><break time='700ms'/>")
             else:
-                ssml_parts.append("<break time='700ms'/>")
-        else:
-            s = html_escape_basic(s)
-            br = "220ms" if len(s) < 120 else "300ms"
-            ssml_parts.append(f"<s>{s}</s><break time='{br}'/>")
+                ssml_parts.append(f"<s>{s_esc}</s><break time='{br}'/>")
+        elif long_break:
+            ssml_parts.append("<break time='700ms'/>")
 
     ssml_body = " ".join(ssml_parts)
     ssml = f"""
@@ -264,11 +337,10 @@ def text_to_valid_ssml(text: str, rate: float, pitch_st: float) -> str:
 
 def chunk_script_by_bytes(text: str, max_text_bytes: int = MAX_TEXT_BYTES):
     """
-    Divide o texto bruto em partes com base em bytes (UTF-8),
-    separando preferencialmente por '¦' (seções) e depois por frases.
+    Divide o texto bruto em partes por bytes (UTF-8),
+    priorizando seções '¦' e, depois, sentenças.
     """
     parts = []
-    # 1) tenta dividir pelas seções (marcador '¦')
     sections = [s.strip() for s in text.split("¦") if s.strip()]
     current = ""
     for sec in sections:
@@ -278,11 +350,9 @@ def chunk_script_by_bytes(text: str, max_text_bytes: int = MAX_TEXT_BYTES):
         else:
             if current:
                 parts.append(current)
-            # se a seção sozinha é grande, divide por sentenças
             if len(sec.encode("utf-8")) <= max_text_bytes:
                 current = sec
             else:
-                # divide por sentenças para caber
                 sentences = re.split(r'(?<=[\.\!\?])\s+', sec)
                 chunk = ""
                 for s in sentences:
@@ -293,21 +363,19 @@ def chunk_script_by_bytes(text: str, max_text_bytes: int = MAX_TEXT_BYTES):
                         if chunk:
                             parts.append(chunk)
                         chunk = s
-                if chunk:
-                    current = chunk
-                else:
-                    current = ""
+                current = chunk
     if current:
         parts.append(current)
     return parts if parts else [text]
 
 def synthesize_with_fallback(ssml: str):
     """
-    Tenta sintetizar com as vozes na ordem de VOICE_PREFERENCE.
-    Se uma voz falhar (ex: inexistente), tenta a próxima.
+    Tenta sintetizar com as vozes de VOICE_PREFERENCE.
+    Retorna (BytesIO, voice_name) ou levanta a última exceção.
     """
     init_google_credentials()
     client = tts.TextToSpeechClient()
+    last_error = None
     for voice_name in VOICE_PREFERENCE:
         try:
             synthesis_input = tts.SynthesisInput(ssml=ssml)
@@ -323,6 +391,18 @@ def synthesize_with_fallback(ssml: str):
             last_error = e
             continue
     raise last_error
+
+def join_mp3(buffers):
+    """
+    Junta múltiplos MP3 em um único MP3 por concatenação de frames.
+    (Na prática funciona bem em players/Telegram.)
+    """
+    out = io.BytesIO()
+    for b in buffers:
+        b.seek(0)
+        out.write(b.read())
+    out.seek(0)
+    return out
 
 # =========================
 # Telegram
@@ -340,7 +420,7 @@ def run():
     if not BOT_TOKEN or not CHAT_ID:
         raise SystemExit("Defina TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID como variáveis de ambiente.")
 
-    send_text(CHAT_ID, "🚀 Iniciei o workflow. Vou coletar, resumir e gerar 1 áudio por fonte em PT-BR…")
+    send_text(CHAT_ID, "🎙️ Iniciando: vou coletar, resumir por temas e enviar 1 áudio por fonte (voz masculina, PT-BR)…")
 
     per_source_items = {}
     limit = CFG.get("limit_per_source", LIMIT_PER_SOURCE_DEF)
@@ -376,7 +456,7 @@ def run():
                 sum_lang = "pt" if str(lang).startswith("pt") else "en"
                 summary  = summarize_text(base_text, lang=sum_lang, max_sentences=None)
 
-                # traduz sempre para PT-BR (garante áudio 100% PT)
+                # traduz SEMPRE para PT-BR (garante áudio 100% PT)
                 title_pt   = translate_to_pt(title)
                 summary_pt = translate_to_pt(summary)
 
@@ -392,9 +472,15 @@ def run():
                 count += 1
 
     total_boletins = 0
-    for source_name, items in per_source_items.items():
+    for feed in CFG["feeds"]:
+        source_name = feed["name"]
+        lang        = feed.get("lang", "pt")
+        items       = per_source_items.get(source_name, [])
         if not items:
             continue
+
+        # nomes ingleses (para pronúncia en-US) — só para fontes em inglês
+        names_en = extract_english_names(items, lang)
 
         grouped   = group_by_topic_pt(items)
         script_pt = build_audio_script_pt(source_name, grouped)
@@ -415,22 +501,22 @@ def run():
         # --- Chunking por bytes (antes de virar SSML) ---
         text_chunks = chunk_script_by_bytes(script_pt, max_text_bytes=MAX_TEXT_BYTES)
 
-        # Gera e envia o(s) áudios (Parte 1/2/…)
+        # Síntese de todas as partes e JUNÇÃO em um único MP3
+        part_buffers = []
+        used_voice_name = None
         for idx, chunk_text in enumerate(text_chunks, start=1):
             try:
-                ssml = text_to_valid_ssml(chunk_text, VOICE_RATE, VOICE_PITCH)
+                ssml = text_to_valid_ssml(chunk_text, VOICE_RATE, VOICE_PITCH, names_en=names_en)
 
-                # Checagem final de bytes do SSML; se ainda estiver grande, fatiamos por frases
+                # Garantia final de bytes do SSML
                 if len(ssml.encode("utf-8")) > MAX_SSML_BYTES:
-                    # divide por frases de novo
+                    # Divide novamente por sentenças se necessário
                     sentences = re.split(r'(?<=[\.\!\?])\s+', chunk_text)
-                    sub = []
-                    current = ""
                     subparts = []
+                    current = ""
                     for s in sentences:
                         cand = (current + " " + s).strip() if current else s
-                        # cria ssml temporário para aferir bytes
-                        tmp_ssml = text_to_valid_ssml(cand, VOICE_RATE, VOICE_PITCH)
+                        tmp_ssml = text_to_valid_ssml(cand, VOICE_RATE, VOICE_PITCH, names_en=names_en)
                         if len(tmp_ssml.encode("utf-8")) <= MAX_SSML_BYTES:
                             current = cand
                         else:
@@ -440,21 +526,22 @@ def run():
                     if current:
                         subparts.append(current)
 
-                    # sintetiza subpartes
-                    for j, subtext in enumerate(subparts, start=1):
-                        ssml_sub = text_to_valid_ssml(subtext, VOICE_RATE, VOICE_PITCH)
-                        audio_buf, used_voice = synthesize_with_fallback(ssml_sub)
-                        title_audio = f"{source_name} — Boletim (parte {idx}.{j}) — {used_voice}"
-                        filename    = f"{source_name}_boletim_{idx}_{j}.mp3"
-                        send_audio(CHAT_ID, audio_buf, title=title_audio, performer=source_name, filename=filename)
+                    for sp in subparts:
+                        ssml_sub = text_to_valid_ssml(sp, VOICE_RATE, VOICE_PITCH, names_en=names_en)
+                        audio_buf, used_voice_name = synthesize_with_fallback(ssml_sub)
+                        part_buffers.append(audio_buf)
                 else:
-                    audio_buf, used_voice = synthesize_with_fallback(ssml)
-                    title_audio = f"{source_name} — Boletim (parte {idx}/{len(text_chunks)}) — {used_voice}"
-                    filename    = f"{source_name}_boletim_{idx}.mp3" if len(text_chunks) > 1 else f"{source_name}_boletim.mp3"
-                    send_audio(CHAT_ID, audio_buf, title=title_audio, performer=source_name, filename=filename)
+                    audio_buf, used_voice_name = synthesize_with_fallback(ssml)
+                    part_buffers.append(audio_buf)
 
             except Exception as e:
-                send_text(CHAT_ID, f"❌ Falha ao sintetizar {source_name} (parte {idx}): {e}")
+                send_text(CHAT_ID, f"❌ Falha ao sintetizar parte do {source_name}: {e}")
+
+        if part_buffers:
+            full_mp3 = join_mp3(part_buffers)
+            title_audio = f"{source_name} — Boletim (voz: {used_voice_name})"
+            filename    = f"{source_name}_boletim.mp3"
+            send_audio(CHAT_ID, full_mp3, title=title_audio, performer=source_name, filename=filename)
 
         total_boletins += 1
         time.sleep(1)
