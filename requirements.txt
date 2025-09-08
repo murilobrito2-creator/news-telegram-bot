@@ -1,0 +1,9 @@
+feedparser
+readability-lxml
+requests
+python-telegram-bot==13.15
+gTTS
+PyYAML
+lxml
+sumy
+python-dateutil
