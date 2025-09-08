@@ -50,7 +50,7 @@ def fetch_fulltext(url, timeout=12):
     except Exception:
         return ""
 
-def summarize_text(text, lang="en", max_sentences=5):
+def summarize_text(text, lang="pt", max_sentences=5):
     """Resumo extrativo com TextRank (leve, sem IA paga).
        Se o texto for curto, devolve o próprio texto."""
     text = clean(text)
@@ -127,7 +127,7 @@ def run():
                 summary = summarize_text(base_text, lang=lang)
 
                 # TTS idioma: PT para G1; EN para NYT/CNN
-                tts_lang = "pt" if lang.startswith("pt") else "en"
+                tts_lang = "pt" if lang.startswith("pt") else "pt"
                 audio = make_tts(f"{title}. {summary}", lang_code=tts_lang)
 
                 # envia
