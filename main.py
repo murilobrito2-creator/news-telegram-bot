@@ -136,18 +136,33 @@ def translate_to_pt(text, src_lang):
 
 def make_tts(text, voice_name=VOICE_NAME, speaking_rate=VOICE_RATE, pitch_semitones=VOICE_PITCH):
     """
-    Gera áudio com voz neural do Google (mais natural).
-    Sugestões: 'pt-BR-Neural2-A/B/C/D' ou 'pt-BR-Wavenet-A/B/C/D'.
+    TTS com SSML mais natural:
+    - Pausas curtas entre frases
+    - Ritmo levemente reduzido
+    - Pitch sutilmente elevado
     """
     init_google_credentials()
     client = tts.TextToSpeechClient()
 
+    # troca '¦' por uma pausa maior (ex.: transição de seção)
+    text = text.replace("¦", "<LONG_BREAK>")
+
+    sentences = [s.strip() for s in text.split(".") if s.strip()]
+    ssml_sentences = []
+    for i, s in enumerate(sentences, start=1):
+        if "<LONG_BREAK>" in s:
+            s = s.replace("<LONG_BREAK>", "")
+            ssml_sentences.append(f"<s>{s}.</s><break time='650ms'/>")
+        else:
+            br = '<break time="220ms"/>' if len(s) < 120 else '<break time="300ms"/>'
+            ssml_sentences.append(f"<s>{s}.</s>{br}")
+            
     ssml = f"""
 <speak>
   <p>
-    <s><prosody rate="{speaking_rate}" pitch="{pitch_semitones:+.1f}st">
-      {text}
-    </prosody></s>
+    <prosody rate="{speaking_rate}" pitch="{pitch_semitones:+.1f}st">
+      {' '.join(ssml_sentences)}
+    </prosody>
   </p>
 </speak>
     """.strip()
@@ -163,7 +178,7 @@ def make_tts(text, voice_name=VOICE_NAME, speaking_rate=VOICE_RATE, pitch_semito
     buf = io.BytesIO(response.audio_content)
     buf.seek(0)
     return buf
-
+    
 def send_text(chat_id, text):
     Bot(token=BOT_TOKEN).send_message(chat_id=chat_id, text=text, parse_mode="HTML", disable_web_page_preview=False)
 
@@ -234,24 +249,38 @@ def group_by_topic_pt(items_pt):
 
 def build_audio_script_pt(source_name, grouped_topics):
     """
-    Monta o roteiro em PT-BR por tópicos:
-    - Abertura
-    - Para cada tópico: título do tópico + itens numerados com título + resumo
-    - Encerramento
+    Roteiro em PT-BR por tópicos, com conectivos e 'marcadores' para guiar a prosódia.
     """
     partes = []
     hoje = datetime.now().strftime("%d/%m/%Y")
-    partes.append(f"Boletim de notícias do {source_name}, {hoje}.")
-    partes.append("Principais destaques organizados por assunto:")
 
+    # Abertura
+    partes.append(f"Boletim de notícias do {source_name}, {hoje}.")
+    partes.append("Vamos aos destaques organizados por assunto.")
+
+    # Tópicos
     for topic, items in grouped_topics.items():
         partes.append(f"Seção: {topic}.")
+        # introdução do tema ajuda a voz a “respirar”
+        partes.append("Principais pontos:")
+
         for i, it in enumerate(items, start=1):
             titulo = clean(it["title_pt"])
             resumo = clean(it["summary_pt"])
-            partes.append(f"{i}. {titulo}. {resumo}")
+            # breve conector e enumeração
+            partes.append(f"Notícia {i}: {titulo}.")
+            partes.append(f"Resumo: {resumo}")
 
-    partes.append("Esses foram os principais temas. Até a próxima edição.")
+        # fechamento de seção (ajuda a variação prosódica)
+        partes.append("Fechamos esta seção.")
+
+        partes.append("¦")  # marcador para uma pausa maior personalizada
+
+    # Encerramento
+    partes.append("Esses foram os assuntos mais relevantes de hoje.")
+    partes.append("Até a próxima edição.")
+
+
     return " ".join(partes)
 
 
