@@ -47,11 +47,11 @@ else:
 # -------------------------
 # Parâmetros de detalhamento / voz
 # -------------------------
-SENTENCES_PER_ITEM = 3        # nº base de frases por notícia (2–4 bom)
-MAX_ITEMS_PER_TOPIC = 3       # nº máx. de notícias por tópico (evitar áudio cansativo)
-VOICE_NAME = "pt-BR-Neural2-B"
-VOICE_RATE = 1.02             # 1.00–1.06 (mais fluidez)
-VOICE_PITCH = +1.0            # leve ganho de pitch
+SENTENCES_PER_ITEM = 4        # mais conteúdo por notícia
+MAX_ITEMS_PER_TOPIC = 4       # até 4 por tema (ajusta se quiser)
+VOICE_NAME = "pt-BR-Neural2-A"  # timbre mais quente; teste A ou C
+VOICE_RATE = 0.99             # um pouco mais lento, soa menos “robótico”
+VOICE_PITCH = +0.5            # sutilmente mais alto, mas natural
 
 
 # -------------------------
