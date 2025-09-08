@@ -7,3 +7,4 @@ lxml
 sumy
 python-dateutil
 google-cloud-texttospeech
+deep-translator
