@@ -1,27 +1,10 @@
-from google.cloud import texttospeech as tts
-import os, io
-
-def make_tts(text, voice_name="pt-BR-Neural2-B", speaking_rate=1.03, pitch_semitones=+1.0):
-    client = tts.TextToSpeechClient()
-
-    ssml = f"""
-<speak>
-  <p>
-    <s><prosody rate="{speaking_rate}" pitch="{pitch_semitones:+.1f}st">
-      {text}
-    </prosody></s>
-  </p>
-</speak>
-    """.strip()
-
-    synthesis_input = tts.SynthesisInput(ssml=ssml)
-    voice = tts.VoiceSelectionParams(language_code="pt-BR", name=voice_name)
-    audio_config = tts.AudioConfig(audio_encoding=tts.AudioEncoding.MP3)
-
-    response = client.synthesize_speech(
-        input=synthesis_input, voice=voice, audio_config=audio_config
-    )
-
-    buf = io.BytesIO(response.audio_content)
-    buf.seek(0)
-    return buf
+def send_to_telegram(title, summary, link, audio_buf, source_name):
+    bot = Bot(token=BOT_TOKEN)
+    # Use HTML para evitar erros comuns do Markdown
+    caption = f"<b>{source_name}</b> — <b>{title}</b>\n{link}"
+    text = f"📰 <b>{source_name}</b>\n<b>{title}</b>\n\n{summary}\n\n🔗 {link}"
+    # Envia texto
+    bot.send_message(chat_id=CHAT_ID, text=text, parse_mode="HTML", disable_web_page_preview=False)
+    # Envia áudio
+    filename = f"{source_name}_{int(time.time())}.mp3"
+    bot.send_audio(chat_id=CHAT_ID, audio=audio_buf, title=title, performer=source_name, filename=filename)
