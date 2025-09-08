@@ -11,5 +11,5 @@ feeds:
     lang: "en"
     urls:
       - "http://rss.cnn.com/rss/edition.rss"
-limit_per_source: 1            # quantas notícias por fonte por dia
-min_chars_to_summarize: 800    # se o texto for menor que isso, manda sem resumir
+limit_per_source: 6
+min_chars_to_summarize: 600
