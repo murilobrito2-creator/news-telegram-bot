@@ -7,3 +7,4 @@ PyYAML
 lxml
 sumy
 python-dateutil
+google-cloud-texttospeech
