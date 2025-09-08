@@ -4,12 +4,13 @@ feeds:
     urls:
       - "https://g1.globo.com/rss/g1/"
   - name: "NYTimes"
-    lang: "en"
+    lang: "pt"
     urls:
       - "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml"
   - name: "CNN"
-    lang: "en"
+    lang: "pt"
     urls:
       - "http://rss.cnn.com/rss/edition.rss"
 limit_per_source: 8
 min_chars_to_summarize: 700
+
