@@ -1,0 +1,15 @@
+feeds:
+  - name: "G1"
+    lang: "pt"
+    urls:
+      - "https://g1.globo.com/rss/g1/"
+  - name: "NYTimes"
+    lang: "en"
+    urls:
+      - "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml"
+  - name: "CNN"
+    lang: "en"
+    urls:
+      - "http://rss.cnn.com/rss/edition.rss"
+limit_per_source: 3            # quantas notícias por fonte por dia
+min_chars_to_summarize: 800    # se o texto for menor que isso, manda sem resumir
