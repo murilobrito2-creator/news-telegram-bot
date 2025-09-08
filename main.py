@@ -1,7 +1,7 @@
 # main.py
-# Bot de notícias diário (G1, NYTimes, CNN) com resumo + ÁUDIO POR FONTE em PT-BR
-# TTS: Google Cloud Text-to-Speech (Neural2/WaveNet) + SSML
-# Tradução para PT-BR: deep-translator (usa serviços públicos gratuitos)
+# Bot de notícias diário com resumo detalhado, agrupado por assuntos,
+# e 1 ÁUDIO POR FONTE em PT-BR (G1 / NYTimes / CNN).
+# TTS: Google Cloud Text-to-Speech (Neural2/WaveNet) + SSML.
 
 import os, io, time, json, hashlib, requests, feedparser, yaml
 from datetime import datetime
@@ -10,7 +10,6 @@ from urllib.parse import urlparse
 
 from lxml import html
 from readability import Document
-
 from telegram import Bot
 
 # Resumo extrativo leve (sem API paga)
@@ -21,8 +20,9 @@ from sumy.summarizers.text_rank import TextRankSummarizer
 # Google TTS
 from google.cloud import texttospeech as tts
 
-# Tradução
+# Tradução automática
 from deep_translator import GoogleTranslator
+
 
 # -------------------------
 # Variáveis de ambiente
@@ -31,7 +31,7 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # -------------------------
-# Carrega configurações
+# Configurações gerais
 # -------------------------
 CFG_PATH = "sources.yaml"
 with open(CFG_PATH, "r", encoding="utf-8") as f:
@@ -45,10 +45,23 @@ else:
     SEEN = set()
 
 # -------------------------
+# Parâmetros de detalhamento / voz
+# -------------------------
+SENTENCES_PER_ITEM = 3        # nº base de frases por notícia (2–4 bom)
+MAX_ITEMS_PER_TOPIC = 3       # nº máx. de notícias por tópico (evitar áudio cansativo)
+VOICE_NAME = "pt-BR-Neural2-B"
+VOICE_RATE = 1.02             # 1.00–1.06 (mais fluidez)
+VOICE_PITCH = +1.0            # leve ganho de pitch
+
+
+# -------------------------
 # Utilidades
 # -------------------------
 def init_google_credentials():
-    """Cria /tmp/gcred.json se GOOGLE_APPLICATION_CREDENTIALS_JSON vier nos Secrets."""
+    """
+    Cria /tmp/gcred.json se o Secret GOOGLE_APPLICATION_CREDENTIALS_JSON
+    estiver configurado no GitHub Actions.
+    """
     cred_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
     if cred_json and not os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
         path = "/tmp/gcred.json"
@@ -76,13 +89,25 @@ def fetch_fulltext(url, timeout=12):
     except Exception:
         return ""
 
-def summarize_text(text, lang="en", max_sentences=5, min_chars=None):
-    """Resumo extrativo (TextRank). Se texto for curto, devolve o próprio texto."""
+def summarize_text(text, lang="en", max_sentences=None, min_chars=None):
+    """
+    Resumo extrativo (TextRank) com saída mais substanciosa.
+    Ajusta nº de frases com base no tamanho do texto.
+    Se o texto for curto, devolve o próprio texto.
+    """
     text = clean(text)
     if not min_chars:
-        min_chars = CFG.get("min_chars_to_summarize", 800)
+        min_chars = CFG.get("min_chars_to_summarize", 600)
     if len(text) < min_chars:
         return text
+
+    if max_sentences is None:
+        if len(text) < 1200:
+            max_sentences = max(2, SENTENCES_PER_ITEM)        # curta
+        elif len(text) < 2500:
+            max_sentences = max(3, SENTENCES_PER_ITEM + 1)    # média
+        else:
+            max_sentences = max(4, SENTENCES_PER_ITEM + 2)    # longa
 
     lang_map = {"pt": "portuguese", "en": "english"}
     sumy_lang = lang_map.get(lang, "english")
@@ -92,7 +117,7 @@ def summarize_text(text, lang="en", max_sentences=5, min_chars=None):
         summarizer = TextRankSummarizer()
         sentences = summarizer(parser.document, max_sentences)
         summary = " ".join(str(s) for s in sentences)
-        if len(clean(summary)) < 100:
+        if len(clean(summary)) < 120:
             summary = " ".join(text.split(". ")[:max_sentences]) + "."
         return summary
     except Exception:
@@ -102,18 +127,17 @@ def translate_to_pt(text, src_lang):
     """Traduz para PT-BR se a fonte não for PT. Mantém em PT se já estiver em PT."""
     if not text:
         return text
-    if src_lang.lower().startswith("pt"):
+    if str(src_lang).lower().startswith("pt"):
         return text
     try:
         return GoogleTranslator(source="auto", target="pt").translate(text)
     except Exception:
-        # fallback: devolve original se der erro ao traduzir
-        return text
+        return text  # fallback: original
 
-def make_tts(text, voice_name="pt-BR-Neural2-B", speaking_rate=1.03, pitch_semitones=+1.0):
+def make_tts(text, voice_name=VOICE_NAME, speaking_rate=VOICE_RATE, pitch_semitones=VOICE_PITCH):
     """
     Gera áudio com voz neural do Google (mais natural).
-    Sugestões de voz: 'pt-BR-Neural2-A/B/C/D' ou 'pt-BR-Wavenet-A/B/C/D'.
+    Sugestões: 'pt-BR-Neural2-A/B/C/D' ou 'pt-BR-Wavenet-A/B/C/D'.
     """
     init_google_credentials()
     client = tts.TextToSpeechClient()
@@ -150,12 +174,11 @@ def item_id(entry):
     base = entry.get("id") or entry.get("link") or entry.get("title", "")
     return hashlib.sha1(base.encode("utf-8")).hexdigest()
 
-def chunk_text(text, max_chars=4500):
-    """Divide texto grande em blocos (Google TTS aceita ~5000 chars)."""
+def chunk_text(text, max_chars=4400):
+    """Divide texto grande em blocos (~5k chars é o limite seguro do TTS)."""
     text = text.strip()
     chunks = []
     while len(text) > max_chars:
-        # corta em um ponto próximo de quebra de frase
         cut = text.rfind(". ", 0, max_chars)
         if cut == -1:
             cut = max_chars
@@ -165,23 +188,72 @@ def chunk_text(text, max_chars=4500):
         chunks.append(text)
     return chunks
 
-def build_audio_script_pt(source_name, items_pt):
+# -------------------------
+# Agrupamento por assuntos (PT)
+# -------------------------
+def detect_topic_pt(title_pt, summary_pt):
     """
-    Monta o roteiro em PT-BR para um único áudio da fonte:
-    - Abertura + lista numerada (título + resumo) + encerramento curto.
+    Classificação simples por palavras-chave (PT-BR).
+    Se não bater, cai em 'Outros'.
     """
-    linhas = []
+    text = f"{title_pt} {summary_pt}".lower()
+
+    topics = {
+        "Política":    ["política", "governo", "congresso", "câmara", "senado", "eleição", "ministro", "prefeitura", "presidente", "plano diretor"],
+        "Economia":    ["economia", "inflação", "juros", "banco central", "dólar", "balanço", "mercado", "crescimento", "desemprego", "investimento"],
+        "Mundo":       ["mundo", "internacional", "guerra", "acordo", "otan", "onu", "rússia", "china", "eua", "europeu"],
+        "Tecnologia":  ["tecnologia", " ia ", "inteligência artificial", "startup", "software", "app", "privacidade", "segurança digital"],
+        "Esportes":    ["esporte", "futebol", "basquete", "vôlei", "olimpíada", "campeonato", "técnico", "clube", "seleção"],
+        "Saúde":       ["saúde", "covid", "vacina", "hiv", "h1n1", "hospital", "sus"],
+        "Cultura":     ["cultura", "cinema", "série", "filme", "música", "artes", "teatro", "festival"],
+        "Ciência":     ["ciência", "pesquisa", "universidade", "estudo científico", "descoberta"],
+        "Negócios":    ["negócio", "empresa", "lucro", "fusão", "aquisição", "resultado", "receita", "expansão", "contrato"]
+    }
+
+    for topic, keywords in topics.items():
+        if any(k in text for k in keywords):
+            return topic
+    return "Outros"
+
+def group_by_topic_pt(items_pt):
+    """
+    items_pt: lista de dicts com 'title_pt' e 'summary_pt'
+    Retorna: dict { tópico: [itens...] }
+    Limita itens por tópico em MAX_ITEMS_PER_TOPIC (para áudio ficar agradável).
+    """
+    grouped = {}
+    for it in items_pt:
+        topic = detect_topic_pt(it["title_pt"], it["summary_pt"])
+        grouped.setdefault(topic, [])
+        if len(grouped[topic]) < MAX_ITEMS_PER_TOPIC:
+            grouped[topic].append(it)
+
+    order = ["Política", "Economia", "Mundo", "Tecnologia", "Negócios", "Saúde", "Esportes", "Cultura", "Ciência", "Outros"]
+    grouped_sorted = {t: grouped[t] for t in order if t in grouped and grouped[t]}
+    return grouped_sorted
+
+def build_audio_script_pt(source_name, grouped_topics):
+    """
+    Monta o roteiro em PT-BR por tópicos:
+    - Abertura
+    - Para cada tópico: título do tópico + itens numerados com título + resumo
+    - Encerramento
+    """
+    partes = []
     hoje = datetime.now().strftime("%d/%m/%Y")
-    linhas.append(f"Boletim de notícias do {source_name}, {hoje}.")
-    linhas.append("Confira os destaques:")
+    partes.append(f"Boletim de notícias do {source_name}, {hoje}.")
+    partes.append("Principais destaques organizados por assunto:")
 
-    for i, it in enumerate(items_pt, start=1):
-        titulo = it["title_pt"]
-        resumo = it["summary_pt"]
-        linhas.append(f"{i}. {titulo}. {resumo}")
+    for topic, items in grouped_topics.items():
+        partes.append(f"Seção: {topic}.")
+        for i, it in enumerate(items, start=1):
+            titulo = clean(it["title_pt"])
+            resumo = clean(it["summary_pt"])
+            partes.append(f"{i}. {titulo}. {resumo}")
 
-    linhas.append("Esses foram os principais destaques. Até a próxima edição.")
-    return " ".join(linhas)
+    partes.append("Esses foram os principais temas. Até a próxima edição.")
+    return " ".join(partes)
+
 
 # -------------------------
 # Fluxo principal
@@ -194,8 +266,8 @@ def run():
     send_text(CHAT_ID, "🚀 Iniciei o workflow. Vou coletar, resumir e gerar 1 áudio por fonte em PT-BR…")
 
     # Coletar itens por fonte (sem enviar ainda)
-    per_source_items = {}  # { source_name: [ {title, link, summary_pt, title_pt}, ... ] }
-    limit = CFG.get("limit_per_source", 3)
+    per_source_items = {}  # { source_name: [ {title, link, summary, title_pt, summary_pt}, ... ] }
+    limit = CFG.get("limit_per_source", 6)
 
     for feed in CFG["feeds"]:
         source = feed["name"]
@@ -212,6 +284,7 @@ def run():
             for entry in d.entries:
                 if count >= limit:
                     break
+
                 iid = item_id(entry)
                 if iid in SEEN:
                     continue
@@ -225,11 +298,9 @@ def run():
                 if not base_text.strip():
                     base_text = f"{title}. {desc}"
 
-                # sumariza no idioma de origem
-                sum_lang = "pt" if lang.startswith("pt") else "en"
-                summary = summarize_text(base_text, lang=sum_lang, max_sentences=5)
+                sum_lang = "pt" if str(lang).startswith("pt") else "en"
+                summary = summarize_text(base_text, lang=sum_lang, max_sentences=None)
 
-                # traduz tudo para PT-BR (título e resumo)
                 title_pt = translate_to_pt(title, lang)
                 summary_pt = translate_to_pt(summary, lang)
 
@@ -250,23 +321,27 @@ def run():
         if not items:
             continue
 
-        # Monta roteiro (PT-BR) com títulos e resumos traduzidos
-        script = build_audio_script_pt(source_name, items)
+        # Agrupa por tópicos (PT) e monta roteiro mais completo
+        grouped = group_by_topic_pt(items)
+        script = build_audio_script_pt(source_name, grouped)
 
-        # Divide se for muito grande para o TTS
-        partes = chunk_text(script, max_chars=4500)
-
-        # Envia caption/links em texto (opcional)
+        # Envia um texto com a lista por tópico (útil para acompanhar com links)
         try:
-            bullets = "\n".join([f"• <b>{clean(it['title_pt'])}</b>\n🔗 {it['link']}" for it in items])
-            send_text(CHAT_ID, f"📰 <b>{source_name}</b> — Destaques da edição:\n\n{bullets}")
+            blocks = []
+            for topic, itlist in grouped.items():
+                bullets = "\n".join([f"• <b>{clean(it['title_pt'])}</b>\n🔗 {it['link']}" for it in itlist])
+                blocks.append(f"<u><b>{topic}</b></u>\n{bullets}")
+            send_text(CHAT_ID, f"📰 <b>{source_name}</b> — Destaques por assunto:\n\n" + "\n\n".join(blocks))
         except Exception:
             pass
+
+        # Divide se for muito grande para o TTS
+        partes = chunk_text(script, max_chars=4400)
 
         # Gera e envia o(s) áudio(s)
         for idx, parte in enumerate(partes, start=1):
             try:
-                audio_buf = make_tts(parte, voice_name="pt-BR-Neural2-B", speaking_rate=1.03, pitch_semitones=+1.0)
+                audio_buf = make_tts(parte, voice_name=VOICE_NAME, speaking_rate=VOICE_RATE, pitch_semitones=VOICE_PITCH)
                 titulo_audio = f"{source_name} — Boletim ({idx}/{len(partes)})" if len(partes) > 1 else f"{source_name} — Boletim"
                 filename = f"{source_name}_boletim_{idx}.mp3" if len(partes) > 1 else f"{source_name}_boletim.mp3"
                 send_audio(CHAT_ID, audio_buf, title=titulo_audio, performer=source_name, filename=filename)
