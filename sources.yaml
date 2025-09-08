@@ -11,5 +11,5 @@ feeds:
     lang: "en"
     urls:
       - "http://rss.cnn.com/rss/edition.rss"
-limit_per_source: 6
-min_chars_to_summarize: 600
+limit_per_source: 8
+min_chars_to_summarize: 700
